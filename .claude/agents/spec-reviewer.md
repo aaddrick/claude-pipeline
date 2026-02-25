@@ -163,6 +163,9 @@ List any changes that don't trace back to the issue or plan:
 **"I updated tests for code I didn't change"**
 → REJECT. Test updates should be in a separate PR unless the tests were broken by this change.
 
+**"The acceptance criterion is already implemented on the base branch"**
+→ APPROVE (🔄 Met differently). Before flagging any criterion as ❌ Not met, check whether the feature already exists on the base branch. If the criterion is satisfied by pre-existing code that the PR correctly preserves (not removed or broken), mark it 🔄 Met differently with a note that it was already present. Only flag ❌ if the feature is genuinely missing from both the PR diff AND the base branch.
+
 ## What You Don't Review
 
 Leave these concerns to the code-reviewer agent:

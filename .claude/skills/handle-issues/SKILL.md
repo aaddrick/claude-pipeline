@@ -278,7 +278,7 @@ while true; do
         COMPLETED=$(jq -r '.progress.completed' status.json)
         FAILED=$(jq -r '.progress.failed' status.json)
         TOTAL=$(jq -r '.progress.total' status.json)
-        CURRENT=$(jq -r '.current_issue // "none"' status.json)
+        CURRENT=$(jq -r '(.current_issues // []) | if length == 0 then "none" elif length == 1 then "#\(.[0])" else [.[] | "#\(.)"] | join(", ") end' status.json)
         RATE_LIMITED=$(jq -r '.rate_limit.waiting' status.json)
 
         # Calculate lines changed since start (vs base branch)
@@ -286,9 +286,9 @@ while true; do
 
         if [[ "$RATE_LIMITED" == "true" ]]; then
             RESUME_AT=$(jq -r '.rate_limit.resume_at' status.json)
-            echo "[$(date +%H:%M)] $COMPLETED/$TOTAL complete, $FAILED failed | Current: #$CURRENT | Lines changed: $LINES_CHANGED | Rate limited until $RESUME_AT"
+            echo "[$(date +%H:%M)] $COMPLETED/$TOTAL complete, $FAILED failed | Current: $CURRENT | Lines changed: $LINES_CHANGED | Rate limited until $RESUME_AT"
         else
-            echo "[$(date +%H:%M)] $COMPLETED/$TOTAL complete, $FAILED failed | Current: #$CURRENT | Lines changed: $LINES_CHANGED"
+            echo "[$(date +%H:%M)] $COMPLETED/$TOTAL complete, $FAILED failed | Current: $CURRENT | Lines changed: $LINES_CHANGED"
         fi
 
         # Exit conditions

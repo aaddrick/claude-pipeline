@@ -346,3 +346,35 @@ Grid children with wide content can expand the grid. Always set `min-width: 0`:
     min-width: 0;  /* Allows content to shrink */
     overflow: hidden;  /* Or clip overflow */
 }
+```
+
+## Specificity Pitfalls
+
+### Never Use ID Selectors for Shared Components
+
+ID selectors (`#id`) have higher specificity than class selectors (`.class`). When the same component appears on multiple pages styled by different CSS files, an ID selector in one file silently overrides class-based rules in all others.
+
+```css
+/* BAD: ID selector overrides .class rules everywhere */
+#popup {
+    max-width: 350px;  /* Wins everywhere — impossible to override with classes */
+}
+
+/* GOOD: Class selector — same specificity, predictable cascade */
+.popup {
+    max-width: 350px;
+}
+```
+
+### One Component, One Source of Truth
+
+When a component is used across multiple pages, style it in **one place** using class selectors. Don't duplicate styling across page-specific CSS files with conflicting approaches.
+
+```css
+/* BAD: Same component styled differently in two files */
+/* page-a.css */  #popup { left: var(--x); top: var(--y); }
+/* page-b.css */  .popup { transform: translate(var(--x), var(--y)); }
+
+/* GOOD: Shared class rules in one file, page-specific overrides clearly scoped */
+/* shared */       .popup { left: var(--x); top: var(--y); }
+/* page-specific */ .landing-page .popup { /* only differences */ }

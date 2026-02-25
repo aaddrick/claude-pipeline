@@ -47,26 +47,26 @@ teardown() {
 # DETECT_RATE_LIMIT - TEXT PATTERNS
 # =============================================================================
 
-@test "detect_rate_limit finds 'rate limit' in result" {
-    local output='{"result":"Rate limit exceeded. Please try again later."}'
+@test "detect_rate_limit finds 'rate limit' in error result" {
+    local output='{"result":"Rate limit exceeded. Please try again later.","is_error":true}'
     run detect_rate_limit "$output"
     [ "$status" -eq 0 ]
 }
 
-@test "detect_rate_limit finds '429' in result" {
-    local output='{"result":"HTTP 429: Too Many Requests"}'
+@test "detect_rate_limit finds '429' in error result" {
+    local output='{"result":"HTTP 429: Too Many Requests","is_error":true}'
     run detect_rate_limit "$output"
     [ "$status" -eq 0 ]
 }
 
-@test "detect_rate_limit finds 'too many requests' in result" {
-    local output='{"result":"Error: Too many requests to API"}'
+@test "detect_rate_limit finds 'too many requests' in error result" {
+    local output='{"result":"Error: Too many requests to API","is_error":true}'
     run detect_rate_limit "$output"
     [ "$status" -eq 0 ]
 }
 
-@test "detect_rate_limit finds 'quota exceeded' in result" {
-    local output='{"result":"API quota exceeded for the day"}'
+@test "detect_rate_limit finds 'quota exceeded' in error result" {
+    local output='{"result":"API quota exceeded for the day","is_error":true}'
     run detect_rate_limit "$output"
     [ "$status" -eq 0 ]
 }
@@ -84,7 +84,7 @@ teardown() {
 }
 
 @test "detect_rate_limit is case insensitive" {
-    local output='{"result":"RATE LIMIT hit"}'
+    local output='{"result":"RATE LIMIT hit","is_error":true}'
     run detect_rate_limit "$output"
     [ "$status" -eq 0 ]
 }

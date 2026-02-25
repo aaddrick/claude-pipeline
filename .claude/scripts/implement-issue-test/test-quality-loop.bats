@@ -157,15 +157,14 @@ teardown() {
     local func_def
     func_def=$(declare -f run_quality_loop)
 
-    # Simplify comes before test
-    local simplify_pos test_pos review_pos
+    # Quality loop now does simplify → review (testing is in separate run_test_loop)
+    local simplify_pos review_pos
     simplify_pos=$(echo "$func_def" | grep -n "simplify" | head -1 | cut -d: -f1)
-    test_pos=$(echo "$func_def" | grep -n "test-\${stage_prefix}" | head -1 | cut -d: -f1)
-    review_pos=$(echo "$func_def" | grep -n "review-\${stage_prefix}" | head -1 | cut -d: -f1)
+    review_pos=$(echo "$func_def" | grep -n "review-\${stage_prefix}\|review.*iter" | head -1 | cut -d: -f1)
 
-    # Test comes after simplify
+    # Simplify comes before review
     [ -n "$simplify_pos" ]
-    [ -n "$test_pos" ] || [ -n "$(echo "$func_def" | grep -n 'test-.*iter')" ]
+    [ -n "$review_pos" ]
 }
 
 # =============================================================================
@@ -188,25 +187,25 @@ teardown() {
     [[ "$func_def" == *"implement-issue-simplify.json"* ]]
 }
 
-@test "quality loop calls comment_issue for each sub-stage" {
+@test "quality loop uses log for internal sub-stages" {
     local func_def
     func_def=$(declare -f run_quality_loop)
 
-    # Check for comment_issue calls
-    [[ "$func_def" == *"comment_issue"* ]]
+    # Quality loop now logs internally instead of posting issue comments
+    [[ "$func_def" == *"log "* ]]
 }
 
 # =============================================================================
 # BEHAVIORAL TESTS - RETRY LOGIC
 # =============================================================================
 
-@test "quality loop retries when tests fail then pass" {
-    # Use a file to track calls across subshell boundaries
-    local counter_file="$TEST_TMP/retry_test_count"
+@test "quality loop retries when review requests changes" {
+    # Use a file to track review calls across subshell boundaries
+    local counter_file="$TEST_TMP/retry_review_count"
     echo "0" > "$counter_file"
     export counter_file
 
-    # Mock run_stage to fail tests on first attempt, pass on second
+    # Mock run_stage: review requests changes on first attempt, approves on second
     run_stage() {
         local stage_name="$1"
 
@@ -214,7 +213,7 @@ teardown() {
             simplify-*)
                 echo '{"status":"success","summary":"Simplified code"}'
                 ;;
-            test-*)
+            review-*)
                 # Read and increment counter
                 local count
                 count=$(cat "$counter_file")
@@ -222,26 +221,17 @@ teardown() {
                 echo "$count" > "$counter_file"
 
                 if [[ "$count" -le 1 ]]; then
-                    # First test call fails
-                    echo '{"status":"success","result":"failed","failures":[{"test":"TestCase","message":"failed"}],"summary":"1 test failed"}'
+                    echo '{"status":"success","result":"changes_requested","comments":"Fix naming","summary":"Changes needed"}'
                 else
-                    # Second test call passes
-                    echo '{"status":"success","result":"passed","summary":"All tests passed"}'
+                    echo '{"status":"success","result":"approved","summary":"Code approved"}'
                 fi
                 ;;
-            review-*)
-                echo '{"status":"success","result":"approved","summary":"Code approved"}'
-                ;;
             fix-*)
-                echo '{"status":"success","summary":"Fixed test failures"}'
+                echo '{"status":"success","summary":"Fixed review feedback"}'
                 ;;
         esac
     }
     export -f run_stage
-
-    # Mock comment_issue to avoid gh calls
-    comment_issue() { :; }
-    export -f comment_issue
 
     run_quality_loop "/tmp/worktree" "test-branch" "test"
     local exit_status=$?
@@ -249,10 +239,10 @@ teardown() {
     # Should succeed after retry
     [ "$exit_status" -eq 0 ]
 
-    # Should have gone through at least 2 iterations
-    local iterations
-    iterations=$(jq -r '.quality_iterations' "$STATUS_FILE")
-    [ "$iterations" -ge 2 ]
+    # Should have gone through at least 2 review iterations
+    local review_count
+    review_count=$(cat "$counter_file")
+    [ "$review_count" -ge 2 ]
 }
 
 @test "quality loop has exit 2 for max iterations" {
@@ -273,8 +263,8 @@ teardown() {
 }
 
 @test "quality loop increments iteration on each retry" {
-    # Use a file to track calls across subshell boundaries
-    local counter_file="$TEST_TMP/test_call_count"
+    # Use a file to track review calls across subshell boundaries
+    local counter_file="$TEST_TMP/review_call_count"
     echo "0" > "$counter_file"
     export counter_file
 
@@ -286,7 +276,7 @@ teardown() {
             simplify-*)
                 echo '{"status":"success","summary":"Simplified"}'
                 ;;
-            test-*)
+            review-*)
                 # Read and increment counter
                 local count
                 count=$(cat "$counter_file")
@@ -294,13 +284,10 @@ teardown() {
                 echo "$count" > "$counter_file"
 
                 if [[ "$count" -lt 2 ]]; then
-                    echo '{"status":"success","result":"failed","failures":[{"test":"Test","message":"failed"}],"summary":"Test failed"}'
+                    echo '{"status":"success","result":"changes_requested","comments":"Fix naming","summary":"Changes needed"}'
                 else
-                    echo '{"status":"success","result":"passed","summary":"Tests passed"}'
+                    echo '{"status":"success","result":"approved","summary":"Approved"}'
                 fi
-                ;;
-            review-*)
-                echo '{"status":"success","result":"approved","summary":"Approved"}'
                 ;;
             fix-*)
                 echo '{"status":"success","summary":"Fixed"}'
@@ -309,13 +296,9 @@ teardown() {
     }
     export -f run_stage
 
-    # Mock comment_issue to avoid gh calls
-    comment_issue() { :; }
-    export -f comment_issue
-
     run_quality_loop "/tmp/worktree" "test-branch" "test"
 
-    # Verify we went through multiple test iterations
+    # Verify we went through multiple review iterations
     local final_count
     final_count=$(cat "$counter_file")
     [ "$final_count" -ge 2 ]

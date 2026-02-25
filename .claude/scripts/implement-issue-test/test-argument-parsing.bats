@@ -135,9 +135,10 @@ teardown() {
     [[ "$output" == *"Agent: default"* ]]
 }
 
-@test "defaults status file to status.json" {
-    # Timeout is expected (exit 124) since script will hang after printing header
+@test "defaults status file to per-issue log directory" {
+    # Status file now defaults to LOG_BASE/status.json (per-issue, not shared root)
     run timeout 2 bash "$ORCHESTRATOR_SCRIPT" --issue 123 --branch test 2>&1
     [[ "$status" -eq 0 || "$status" -eq 124 ]] || fail "Unexpected exit status: $status"
-    [[ "$output" == *"Status file: status.json"* ]]
+    [[ "$output" == *"Status file:"* ]]
+    [[ "$output" == *"status.json"* ]]
 }

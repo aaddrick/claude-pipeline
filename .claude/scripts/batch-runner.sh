@@ -149,6 +149,7 @@ IMPLEMENT_SESSION_ID=""
 # Execute claude with implement-issue skill
 # Correct syntax: claude -p "prompt" --flags
 if claude -p "/implement-issue $ISSUE_NUMBER $BASE_BRANCH" \
+    --no-session-persistence \
     --dangerously-skip-permissions \
     --output-format json \
     > "$IMPLEMENT_OUTPUT" 2>&1; then
@@ -247,6 +248,7 @@ PROCESS_OUTPUT=$(mktemp)
 PROCESS_SESSION_ID=""
 
 if claude -p "/process-pr $PR_NUMBER $ISSUE_NUMBER $BASE_BRANCH" \
+    --no-session-persistence \
     --dangerously-skip-permissions \
     --output-format json \
     > "$PROCESS_OUTPUT" 2>&1; then

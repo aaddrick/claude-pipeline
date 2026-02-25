@@ -58,10 +58,9 @@ teardown() {
     [[ "$main_def" == *'set_stage_started "evaluate"'* ]]
     [[ "$main_def" == *'set_stage_started "plan"'* ]]
     [[ "$main_def" == *'set_stage_started "implement"'* ]]
-    [[ "$main_def" == *'set_stage_started "quality_loop"'* ]]
     [[ "$main_def" == *'set_stage_started "docs"'* ]]
     [[ "$main_def" == *'set_stage_started "pr"'* ]]
-    [[ "$main_def" == *'set_stage_started "pr_review"'* ]]
+    [[ "$main_def" == *'set_stage_started "tech_docs"'* ]]
     [[ "$main_def" == *'set_stage_started "complete"'* ]]
 }
 
@@ -228,11 +227,11 @@ teardown() {
     [[ "$main_def" == *'set_final_state "completed"'* ]]
 }
 
-@test "completion stage copies status to log dir" {
+@test "completion stage syncs status to log dir" {
     local main_def
     main_def=$(declare -f main)
 
-    [[ "$main_def" == *'cp "$STATUS_FILE" "$LOG_BASE/status.json"'* ]]
+    [[ "$main_def" == *'sync_status_to_log'* ]]
 }
 
 @test "completion stage exits with 0" {
@@ -325,7 +324,7 @@ teardown() {
 
 @test "orchestrator uses php-test-validator for tests" {
     local func_def
-    func_def=$(declare -f run_quality_loop)
+    func_def=$(declare -f run_test_loop)
 
     [[ "$func_def" == *"php-test-validator"* ]]
 }
@@ -498,9 +497,10 @@ teardown() {
     [ "$(type -t comment_pr)" = "function" ]
 }
 
-@test "REPO constant is defined" {
-    [ -n "$REPO" ]
-    [ -n "$REPO" ]
+@test "REPO is auto-detected from git remote" {
+    local func_content
+    func_content=$(cat "$ORCHESTRATOR_SCRIPT")
+    [[ "$func_content" == *"git remote get-url origin"* ]]
 }
 
 @test "comment_issue uses gh issue comment" {

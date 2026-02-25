@@ -48,6 +48,22 @@ When reviewing completed work, you will:
 
 Your output should be structured, actionable, and focused on helping maintain high code quality while ensuring project goals are met. Be thorough but concise, and always provide constructive feedback that helps improve both the current implementation and future development practices.
 
+## Alpine.js CSP Policy: REJECT Inline Expressions
+
+**If this project uses `@alpinejs/csp`, inline JavaScript expressions cannot be evaluated.** Flag as **Critical (must fix)**:
+
+- Compound expressions in any directive: `x-show="open && items.length > 0"`, `x-if="a || b"`
+- Ternaries in `x-bind:class`: `x-bind:class="active ? 'foo' : 'bar'"`
+- Method calls with arguments: `x-on:click="select(item)"`, `@click="toggle(true)"`
+- Property access chains with operators: `x-text="items.length"`, `x-show="query.length > 0"`
+- Parentheses in event handlers: `@click="dismiss()"` (must be `@click="dismiss"`)
+
+**Required patterns:**
+- Computed getters for compound conditions: `get showResults() { return this.open && this.results.length > 0; }` → `x-show="showResults"`
+- DOM manipulation via `classList.toggle()` for dynamic classes
+- Event delegation with `data-` attributes for parameterized clicks
+- All `x-on:` handlers must be bare method names without parentheses
+
 ## Tailwind CSS Policy: REJECT
 
 **Tailwind utility classes are not acceptable in this codebase.** This is a blocking issue that must be resolved before approval.
@@ -74,3 +90,23 @@ This policy exists because:
 2. HTML becomes unreadable with dozens of utility classes
 3. Changes require modifying markup instead of stylesheets
 4. No design system consistency without semantic naming
+
+## Database Migration Review Checklist
+
+**When a PR includes migrations, review each migration for these issues. Flag violations as Critical (must fix).**
+
+### 1. PostgreSQL Enum/Constraint Handling
+Laravel's `enum()` on PostgreSQL creates **CHECK constraints**, not native PG enum types. When a migration modifies an enum-like column:
+- **REJECT** `DROP TYPE IF EXISTS` for constraint removal — this silently does nothing while the real CHECK constraint remains, causing the subsequent `ADD CONSTRAINT` to fail with a duplicate name error
+- **REQUIRE** `ALTER TABLE ... DROP CONSTRAINT IF EXISTS` before adding a replacement constraint
+- Verify the constraint name matches what Laravel generated (convention: `{table}_{column}_check`)
+
+### 2. Data Migration Atomicity
+Migrations that both **transform data** and **alter schema/constraints** must be atomic:
+- **REJECT** migrations that run data manipulation (INSERT, UPDATE, DELETE) and then DDL (ALTER TABLE, ADD CONSTRAINT) without being wrapped in `DB::transaction()` or using `$withinTransaction = true`
+- If the DDL fails after data has been partially modified, the database is left in an inconsistent state
+
+### 3. Duplicate Prevention in Data Splits
+When a migration splits one row into multiple rows (e.g., converting one type into two separate records):
+- **Flag** INSERT statements inside loops that don't check whether the target row already exists
+- Require a `WHERE NOT EXISTS` or equivalent check before inserting

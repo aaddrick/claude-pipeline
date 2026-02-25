@@ -8,11 +8,15 @@
 #   ./implement-issue-orchestrator.sh --issue 123 --branch test --agent laravel-backend-developer
 #
 # Outputs:
-#   - status.json: Real-time progress
-#   - logs/implement-issue/<timestamp>/: Per-stage logs
+#   - logs/implement-issue/<issue>-<timestamp>/status.json: Real-time progress (per-issue)
+#   - logs/implement-issue/<issue>-<timestamp>/orchestrator.log: Combined log (tail -f friendly)
+#   - logs/implement-issue/<issue>-<timestamp>/stages/: Per-stage logs
 #
 
 set -uo pipefail  # Note: not -e, we handle errors explicitly
+
+# Allow nested Claude CLI invocations when run from within a Claude Code session
+unset CLAUDECODE
 
 # =============================================================================
 # CONFIGURATION
@@ -29,6 +33,11 @@ readonly MAX_TEST_ITERATIONS=10
 readonly MAX_PR_REVIEW_ITERATIONS=3
 readonly RATE_LIMIT_BUFFER=60
 readonly RATE_LIMIT_DEFAULT_WAIT=3600
+readonly LOCK_DIR="logs/implement-issue/locks"
+readonly GIT_RETRY_ATTEMPTS=3
+readonly GIT_RETRY_DELAY=2
+readonly RETRO_MEMORY_FILE="logs/implement-issue/process-retrospective.md"
+RETRO_RAN=false
 
 # =============================================================================
 # ARGUMENT PARSING
@@ -37,28 +46,30 @@ readonly RATE_LIMIT_DEFAULT_WAIT=3600
 ISSUE_NUMBER=""
 BASE_BRANCH=""
 AGENT=""
-STATUS_FILE="status.json"
+STATUS_FILE=""
 RESUME_MODE=""
 RESUME_LOG_DIR=""
 
 usage() {
     cat <<EOF
 Usage: $0 --issue <number> --branch <name> [options]
-       $0 --resume [--status-file <path>]
+       $0 --resume --status-file <path>
        $0 --resume-from <log-dir>
 
 Options:
   --issue <number>       GitHub issue number (required for new runs)
   --branch <name>        Base branch for PR (required for new runs)
   --agent <name>         Default agent for setup stage (optional)
-  --status-file <path>   Custom status file path (optional)
-  --resume               Resume from existing status.json
+  --status-file <path>   Custom status file path (default: <log-dir>/status.json)
+  --resume               Resume from status file (requires --status-file or --resume-from)
   --resume-from <dir>    Resume from specific log directory
 
 Resume modes:
-  --resume uses the current status.json (or --status-file path)
-  --resume-from reads status.json from the specified log directory
+  --resume --status-file <path>  resumes from the given status.json
+  --resume-from <dir>            reads status.json from the specified log directory
 
+Each run creates its own status.json in the log directory.
+A per-issue lock prevents parallel sessions on the same issue number.
 Agents are determined per-task from setup output.
 EOF
     exit 3
@@ -159,6 +170,7 @@ init_status() {
         --arg current_stage "setup" \
         --argjson current_task "null" \
         --arg log_dir "$LOG_BASE" \
+        --arg log_file "$LOG_BASE/orchestrator.log" \
         '{
             state: $state,
             issue: $issue,
@@ -167,6 +179,7 @@ init_status() {
             worktree: $worktree,
             current_stage: $current_stage,
             current_task: $current_task,
+            log_file: $log_file,
             stages: {
                 setup: {status: "pending", started_at: null, completed_at: null},
                 research: {status: "pending", started_at: null, completed_at: null},
@@ -178,7 +191,9 @@ init_status() {
                 docs: {status: "pending"},
                 pr: {status: "pending"},
                 pr_review: {status: "pending", iteration: 0},
-                complete: {status: "pending"}
+                tech_docs: {status: "pending"},
+                complete: {status: "pending"},
+                retrospective: {status: "pending"}
             },
             tasks: [],
             quality_iterations: 0,
@@ -410,6 +425,74 @@ validate_worktree() {
 }
 
 # =============================================================================
+# PER-ISSUE LOCK (prevents two sessions working on the same issue)
+# =============================================================================
+
+LOCK_FILE=""
+
+acquire_issue_lock() {
+    local issue="$1"
+    mkdir -p "$LOCK_DIR"
+    LOCK_FILE="$LOCK_DIR/issue-${issue}.lock"
+
+    if [[ -f "$LOCK_FILE" ]]; then
+        local lock_pid
+        lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+            echo "ERROR: Another session is already working on issue #$issue (PID: $lock_pid)" >&2
+            echo "  Lock file: $LOCK_FILE" >&2
+            echo "  To force, remove the lock file and retry." >&2
+            exit 3
+        fi
+        # Stale lock — previous process died
+        echo "WARNING: Removing stale lock for issue #$issue (PID $lock_pid no longer running)" >&2
+    fi
+
+    echo $$ > "$LOCK_FILE"
+    log "Acquired lock for issue #$issue (PID: $$)"
+}
+
+release_issue_lock() {
+    if [[ -n "$LOCK_FILE" && -f "$LOCK_FILE" ]]; then
+        local lock_pid
+        lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+        # Only remove if we own it
+        if [[ "$lock_pid" == "$$" ]]; then
+            rm -f "$LOCK_FILE"
+        fi
+    fi
+}
+
+cleanup_on_exit() {
+    local trap_exit_code=$?
+    # Run retrospective (non-blocking: failures don't change exit code)
+    run_retrospective "$trap_exit_code" || true
+    release_issue_lock
+    exit "$trap_exit_code"
+}
+trap cleanup_on_exit EXIT
+
+# =============================================================================
+# GIT RETRY HELPER (serializes git operations with retry on lock contention)
+# =============================================================================
+
+git_with_retry() {
+    local attempt=0
+    while (( attempt < GIT_RETRY_ATTEMPTS )); do
+        if git "$@" 2>/dev/null; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        if (( attempt < GIT_RETRY_ATTEMPTS )); then
+            log "Git operation failed (attempt $attempt/$GIT_RETRY_ATTEMPTS), retrying in ${GIT_RETRY_DELAY}s..."
+            sleep "$GIT_RETRY_DELAY"
+        fi
+    done
+    log_error "Git operation failed after $GIT_RETRY_ATTEMPTS attempts: git $*"
+    return 1
+}
+
+# =============================================================================
 # RESUME MODE INITIALIZATION
 # =============================================================================
 
@@ -450,7 +533,13 @@ if [[ "$RESUME_MODE" == "logdir" ]]; then
     fi
 
 elif [[ "$RESUME_MODE" == "status" ]]; then
-    # Resume from current status file
+    # Resume from status file — requires --status-file since there's no global default
+    if [[ -z "$STATUS_FILE" ]]; then
+        echo "ERROR: --resume requires --status-file <path> (no default status.json exists)" >&2
+        echo "  Tip: use --resume-from <log-dir> to resume from a log directory" >&2
+        exit 3
+    fi
+
     if ! validate_resume_status "$STATUS_FILE"; then
         exit 1
     fi
@@ -462,9 +551,17 @@ elif [[ "$RESUME_MODE" == "status" ]]; then
     fi
 
 else
-    # Normal mode - set LOG_BASE
-    LOG_BASE="logs/implement-issue/issue-${ISSUE_NUMBER}-$(date +%Y%m%d-%H%M%S)"
+    # Normal mode - set LOG_BASE with high-precision timestamp + PID to avoid collisions
+    LOG_BASE="logs/implement-issue/issue-${ISSUE_NUMBER}-$(date +%Y%m%d-%H%M%S)-$$"
 fi
+
+# Set STATUS_FILE to live inside LOG_BASE (per-issue, no shared root file)
+if [[ -z "$STATUS_FILE" ]]; then
+    STATUS_FILE="$LOG_BASE/status.json"
+fi
+
+# Acquire per-issue lock (prevents parallel sessions on same issue)
+acquire_issue_lock "$ISSUE_NUMBER"
 
 # Display mode info
 if [[ -n "$RESUME_MODE" ]]; then
@@ -481,8 +578,9 @@ else
     echo "Issue: #$ISSUE_NUMBER"
     echo "Branch: $BASE_BRANCH"
     echo "Agent: ${AGENT:-default}"
-    echo "Status file: $STATUS_FILE"
     echo "Log dir: $LOG_BASE"
+    echo "Status file: $STATUS_FILE"
+    echo "Lock: $LOCK_FILE (PID: $$)"
 fi
 
 # Create log directories
@@ -495,12 +593,13 @@ STAGE_COUNTER=0
 # =============================================================================
 
 # Sync status.json to log directory after every update
-# This ensures status.json exists in LOG_BASE for resume-from functionality
+# Since STATUS_FILE now defaults to LOG_BASE/status.json, this is usually a no-op.
+# It still handles the case where --status-file points elsewhere.
 sync_status_to_log() {
 	if [[ -n "$LOG_BASE" && -d "$LOG_BASE" && -f "$STATUS_FILE" ]]; then
 		local target="$LOG_BASE/status.json"
-		# Avoid copying file to itself (happens with --resume-from)
-		if [[ "$(realpath "$STATUS_FILE")" != "$(realpath "$target")" ]]; then
+		# Avoid copying file to itself (normal case: STATUS_FILE is already in LOG_BASE)
+		if [[ "$(realpath "$STATUS_FILE" 2>/dev/null)" != "$(realpath "$target" 2>/dev/null)" ]]; then
 			cp "$STATUS_FILE" "$target"
 		fi
 	fi
@@ -510,7 +609,7 @@ sync_status_to_log() {
 # GITHUB COMMENT HELPERS
 # =============================================================================
 
-REPO="${GITHUB_REPO:-OWNER/REPO}"
+REPO=$(git remote get-url origin 2>/dev/null | sed -E 's#.*github\.com[:/]##; s/\.git$//')
 
 # comment_issue <title> <body> [agent]
 # If agent is provided, shows "Written by `agent`", otherwise "Posted by orchestrator"
@@ -682,16 +781,26 @@ run_stage() {
     local output
     local exit_code=0
 
-    output=$(timeout "$STAGE_TIMEOUT" claude -p "$prompt" \
+    # Run claude in the worktree directory when available (subshell preserves orchestrator cwd)
+    local run_dir="${WORKTREE:-.}"
+    output=$(cd "$run_dir" && timeout "$STAGE_TIMEOUT" claude -p "$prompt" \
         "${agent_args[@]}" \
+        --no-session-persistence \
         --dangerously-skip-permissions \
+        --strict-mcp-config \
         --output-format json \
         --json-schema "$schema" \
-        2>&1) || exit_code=$?
+        < /dev/null 2>&1) || exit_code=$?
 
     printf '%s\n' "=== $stage_name output ===" >> "$stage_log"
     printf '%s\n' "$output" >> "$stage_log"
     printf '%s\n' "=== exit code: $exit_code ===" >> "$stage_log"
+
+    # Also write to combined log for tail -f
+    if [[ -n "$LOG_FILE" ]]; then
+        printf '[%s] === %s output (exit: %d) ===\n' "$(date -Iseconds)" "$stage_name" "$exit_code" >> "$LOG_FILE"
+        printf '%s\n' "$output" >> "$LOG_FILE"
+    fi
 
     # Check timeout
     if (( exit_code == 124 )); then
@@ -704,15 +813,23 @@ run_stage() {
     if detect_rate_limit "$output"; then
         handle_rate_limit "$output"
         # Retry
-        output=$(timeout "$STAGE_TIMEOUT" claude -p "$prompt" \
+        output=$(cd "$run_dir" && timeout "$STAGE_TIMEOUT" claude -p "$prompt" \
             "${agent_args[@]}" \
+            --no-session-persistence \
             --dangerously-skip-permissions \
+            --strict-mcp-config \
             --output-format json \
             --json-schema "$schema" \
-            2>&1) || exit_code=$?
+            < /dev/null 2>&1) || exit_code=$?
 
         printf '%s\n' "=== $stage_name retry output ===" >> "$stage_log"
         printf '%s\n' "$output" >> "$stage_log"
+
+        # Also write retry to combined log
+        if [[ -n "$LOG_FILE" ]]; then
+            printf '[%s] === %s retry output ===\n' "$(date -Iseconds)" "$stage_name" >> "$LOG_FILE"
+            printf '%s\n' "$output" >> "$LOG_FILE"
+        fi
     fi
 
     # Extract structured output
@@ -734,6 +851,7 @@ run_stage() {
 
 # Run the quality loop (simplify -> review -> fix, repeat)
 # Note: Testing is handled separately by run_test_loop after all tasks complete
+# The code-reviewer recommends the best fix agent per iteration based on the issues found.
 # Arguments:
 #   $1 - worktree path
 #   $2 - branch name
@@ -779,8 +897,8 @@ Output a summary of changes made."
         local simplify_summary
         simplify_summary=$(printf '%s' "$simplify_result" | jq -r '.summary // "No changes"')
 
-        # Comment #7: Simplify summary
-        comment_issue "Quality Loop [$stage_prefix]: Simplify ($loop_iteration/$MAX_QUALITY_ITERATIONS)" "$simplify_summary" "code-simplifier"
+        # Simplify summary (logged only, not posted to issue)
+        log "Quality simplify [$stage_prefix] iter $loop_iteration: $simplify_summary"
 
         # -------------------------------------------------------------------------
         # REVIEW → Issue comment #9
@@ -797,7 +915,13 @@ Check:
 - Security concerns
 
 DO NOT recommend 'approve and merge' - this is not a PR review.
-Simply output 'approved' if code quality is acceptable, or 'changes_requested' with specific issues to fix."
+Simply output 'approved' if code quality is acceptable, or 'changes_requested' with specific issues to fix.
+
+If changes are requested, set recommended_fix_agent to the most appropriate agent for the fixes:
+- laravel-backend-developer: PHP/Laravel code (controllers, models, services, middleware, migrations, tests)
+- bulletproof-frontend-developer: CSS, Blade templates, HTML, frontend code
+- bash-script-craftsman: Shell scripts, BATS tests
+- technical-doc-writer: Architecture docs, design docs, data flows in docs/{domain}/"
 
         local review_result
         review_result=$(run_stage "review-${stage_prefix}-iter-$loop_iteration" "$review_prompt" "implement-issue-review.json" "code-reviewer")
@@ -806,12 +930,8 @@ Simply output 'approved' if code quality is acceptable, or 'changes_requested' w
         review_verdict=$(printf '%s' "$review_result" | jq -r '.result')
         review_summary=$(printf '%s' "$review_result" | jq -r '.summary // "Review completed"')
 
-        # Comment #9: Code review results
-        local review_icon="✅"
-        [[ "$review_verdict" == "changes_requested" ]] && review_icon="🔄"
-        comment_issue "Quality Loop [$stage_prefix]: Code Review ($loop_iteration/$MAX_QUALITY_ITERATIONS)" "$review_icon **Result:** $review_verdict
-
-$review_summary" "code-reviewer"
+        # Code review results (logged only, not posted to issue)
+        log "Quality review [$stage_prefix] iter $loop_iteration: $review_verdict"
 
         if [[ "$review_verdict" == "approved" ]]; then
             loop_approved=true
@@ -821,6 +941,14 @@ $review_summary" "code-reviewer"
             review_comments=$(printf '%s' "$review_result" | jq -r '.comments // "No comments"')
             printf '%s\n' "$review_comments" >> "$LOG_BASE/context/review-comments.json"
 
+            # Use reviewer's recommended agent, fall back to laravel-backend-developer
+            local selected_fix_agent
+            selected_fix_agent=$(printf '%s' "$review_result" | jq -r '.recommended_fix_agent // empty')
+            if [[ -z "$selected_fix_agent" ]]; then
+                selected_fix_agent="laravel-backend-developer"
+            fi
+            log "Quality loop fix agent: $selected_fix_agent (recommended by code-reviewer)"
+
             local fix_prompt="Address code review feedback in worktree $loop_worktree on branch $loop_branch:
 
 $review_comments
@@ -828,13 +956,13 @@ $review_comments
 Fix the issues and commit. Output a summary of fixes applied."
 
             local fix_result
-            fix_result=$(run_stage "fix-review-${stage_prefix}-iter-$loop_iteration" "$fix_prompt" "implement-issue-fix.json" "laravel-backend-developer")
+            fix_result=$(run_stage "fix-review-${stage_prefix}-iter-$loop_iteration" "$fix_prompt" "implement-issue-fix.json" "$selected_fix_agent")
 
             local fix_summary
             fix_summary=$(printf '%s' "$fix_result" | jq -r '.summary // "Fixes applied"')
 
-            # Comment #10: Fix results (review fix)
-            comment_issue "Quality Loop [$stage_prefix]: Review Fix ($loop_iteration/$MAX_QUALITY_ITERATIONS)" "$fix_summary" "laravel-backend-developer"
+            # Review fix results (logged only, not posted to issue)
+            log "Quality fix [$stage_prefix] iter $loop_iteration: $fix_summary"
         fi
     done
 
@@ -896,12 +1024,8 @@ Report pass/fail, test counts, and any failures. Output a summary suitable for a
         test_status=$(printf '%s' "$test_result" | jq -r '.result')
         test_summary=$(printf '%s' "$test_result" | jq -r '.summary // "Tests completed"')
 
-        # Comment: Test results
-        local test_icon="✅"
-        [[ "$test_status" == "failed" ]] && test_icon="❌"
-        comment_issue "Test Loop: Tests ($test_iteration/$MAX_TEST_ITERATIONS)" "$test_icon **Result:** $test_status
-
-$test_summary" "php-test-validator"
+        # Test results (logged only, not posted to issue)
+        log "Test loop iter $test_iteration: $test_status"
 
         if [[ "$test_status" == "failed" ]]; then
             log "Tests failed. Getting failures and fixing..."
@@ -921,8 +1045,8 @@ Fix the issues and commit. Output a summary of fixes applied."
             local fix_summary
             fix_summary=$(printf '%s' "$fix_result" | jq -r '.summary // "Fixes applied"')
 
-            # Comment: Fix results
-            comment_issue "Test Loop: Test Fix ($test_iteration/$MAX_TEST_ITERATIONS)" "$fix_summary" "laravel-backend-developer"
+            # Test fix results (logged only, not posted to issue)
+            log "Test fix iter $test_iteration: $fix_summary"
             continue
         fi
 
@@ -960,12 +1084,8 @@ Output:
         validate_status=$(printf '%s' "$validate_result" | jq -r '.result')
         validate_summary=$(printf '%s' "$validate_result" | jq -r '.summary // "Validation completed"')
 
-        # Comment: Validation results
-        local validate_icon="✅"
-        [[ "$validate_status" == "changes_requested" || "$validate_status" == "failed" ]] && validate_icon="🔄"
-        comment_issue "Test Loop: Validation ($test_iteration/$MAX_TEST_ITERATIONS)" "$validate_icon **Result:** $validate_status
-
-$validate_summary" "php-test-validator"
+        # Validation results (logged only, not posted to issue)
+        log "Test validation iter $test_iteration: $validate_status"
 
         if [[ "$validate_status" == "approved" || "$validate_status" == "passed" ]]; then
             loop_complete=true
@@ -988,12 +1108,137 @@ Output a summary of fixes applied."
             local fix_summary
             fix_summary=$(printf '%s' "$fix_result" | jq -r '.summary // "Fixes applied"')
 
-            # Comment: Fix results
-            comment_issue "Test Loop: Validation Fix ($test_iteration/$MAX_TEST_ITERATIONS)" "$fix_summary" "laravel-backend-developer"
+            # Validation fix results (logged only, not posted to issue)
+            log "Test validation fix iter $test_iteration: $fix_summary"
         fi
     done
 
     return 0
+}
+
+# =============================================================================
+# RETROSPECTIVE (non-blocking, runs after every issue)
+# =============================================================================
+
+run_retrospective() {
+    local exit_code="${1:-$?}"
+
+    # Double-execution guard
+    if [[ "$RETRO_RAN" == "true" ]]; then
+        return 0
+    fi
+    RETRO_RAN=true
+
+    # Need LOG_BASE and STATUS_FILE to proceed
+    if [[ -z "$LOG_BASE" || ! -d "$LOG_BASE" || ! -f "$STATUS_FILE" ]]; then
+        return 0
+    fi
+
+    log "Running process retrospective (exit_code=$exit_code)..."
+    set_stage_started "retrospective"
+
+    # Seed memory file if it does not exist
+    if [[ ! -f "$RETRO_MEMORY_FILE" ]]; then
+        mkdir -p "$(dirname "$RETRO_MEMORY_FILE")"
+        cat > "$RETRO_MEMORY_FILE" <<'SEED'
+# Process Retrospective Memory
+
+## Active Learnings
+
+### agent_selection
+
+### quality_loop
+
+### test_loop
+
+### performance
+
+### error_patterns
+
+### workflow
+
+## Deprecated Learnings
+
+## Run History
+| Run | Issue | Duration | State | Quality Iters | Test Iters | PR Iters | Key Finding |
+|-----|-------|----------|-------|---------------|------------|----------|-------------|
+SEED
+        log "Seeded retrospective memory file: $RETRO_MEMORY_FILE"
+    fi
+
+    # Build paths for the prompt
+    local abs_status abs_log abs_stages abs_context abs_memory
+    abs_status="$(realpath "$STATUS_FILE")"
+    abs_log="$(realpath "$LOG_FILE")"
+    abs_stages="$(realpath "$LOG_BASE/stages")"
+    abs_context="$(realpath "$LOG_BASE/context")"
+    abs_memory="$(realpath "$RETRO_MEMORY_FILE")"
+
+    local retro_prompt="Analyze the implement-issue orchestrator run and produce a retrospective.
+
+## Run Data Locations
+
+- **status.json:** $abs_status
+- **orchestrator.log:** $abs_log
+- **Stage logs directory:** $abs_stages
+- **Context files directory:** $abs_context
+- **Memory file:** $abs_memory
+
+## Instructions
+
+1. Read status.json to get run metrics (stages, iterations, tasks, final state)
+2. Read orchestrator.log for timing and error patterns
+3. Scan stage logs in $abs_stages for anomalies (timeouts, rate limits, excessive output)
+4. Read context files in $abs_context for structured stage outputs
+5. Read the memory file at $abs_memory for prior learnings
+6. Compute run metrics, identify findings, generate recommendations
+7. Update the memory file with new/updated/deprecated learnings (enforce caps: 20 active, 10 deprecated, 20 history rows)
+8. Output structured retrospective data
+
+The run ended with exit code $exit_code."
+
+    local retro_stage_log="$LOG_BASE/stages/$(next_stage_log "retrospective")"
+
+    # NOTE: The process-retrospective agent and implement-issue-retrospective.json schema
+    # need to be created for this project. Until then, this stage will fail gracefully.
+    local retro_output retro_exit=0
+    retro_output=$(cd "${WORKTREE:-.}" && timeout "$STAGE_TIMEOUT" claude -p "$retro_prompt" \
+        --agent "process-retrospective" \
+        --no-session-persistence \
+        --dangerously-skip-permissions \
+        --strict-mcp-config \
+        --output-format json \
+        --json-schema "$(jq -c . "$SCHEMA_DIR/implement-issue-retrospective.json")" \
+        < /dev/null 2>&1) || retro_exit=$?
+
+    # Write to stage log
+    printf '%s\n' "=== retrospective output ===" >> "$retro_stage_log"
+    printf '%s\n' "$retro_output" >> "$retro_stage_log"
+    printf '%s\n' "=== exit code: $retro_exit ===" >> "$retro_stage_log"
+
+    # Write to combined log for tail -f
+    if [[ -n "$LOG_FILE" ]]; then
+        printf '[%s] === retrospective output (exit: %d) ===\n' "$(date -Iseconds)" "$retro_exit" >> "$LOG_FILE"
+        printf '%s\n' "$retro_output" >> "$LOG_FILE"
+    fi
+
+    # Save structured output to context/
+    local retro_structured
+    retro_structured=$(printf '%s' "$retro_output" | jq -c '.structured_output // empty' 2>/dev/null)
+    if [[ -n "$retro_structured" ]]; then
+        printf '%s\n' "$retro_structured" > "$LOG_BASE/context/retrospective-output.json"
+        log "Retrospective output saved to context/retrospective-output.json"
+
+        # Log the summary
+        local retro_summary
+        retro_summary=$(printf '%s' "$retro_structured" | jq -r '.summary // "No summary"')
+        log "Retrospective summary: $retro_summary"
+    else
+        log "Warning: No structured output from retrospective (exit=$retro_exit)"
+    fi
+
+    set_stage_completed "retrospective"
+    log "Retrospective complete."
 }
 
 # =============================================================================
@@ -1061,12 +1306,33 @@ Log directory: \`$LOG_BASE\`"
 4. Create implementation plan
 5. Implement tasks (with per-task quality loop: simplify, review)
 6. Test loop (run tests, fix failures)
-7. Documentation
+7. PHPDoc documentation
 8. Create/update PR
 9. PR review loop
+10. Technical docs (assess if new/updated docs needed, add to PR)
 
 Log directory: \`$LOG_BASE\`"
     fi
+
+    # -------------------------------------------------------------------------
+    # SMOKE TEST: verify claude CLI and API are functional before real work
+    # -------------------------------------------------------------------------
+    log "Running smoke test..."
+    local smoke_output smoke_exit=0
+    smoke_output=$(cd "${WORKTREE:-.}" && timeout 60 claude -p "Respond with exactly: SMOKE_OK" \
+        --no-session-persistence \
+        --dangerously-skip-permissions \
+        --strict-mcp-config \
+        --output-format text \
+        < /dev/null 2>&1) || smoke_exit=$?
+
+    if (( smoke_exit != 0 )) || [[ "$smoke_output" != *"SMOKE_OK"* ]]; then
+        log_error "Smoke test failed (exit=$smoke_exit). Claude CLI or API may be unavailable."
+        log_error "Output: $smoke_output"
+        set_final_state "error"
+        exit 1
+    fi
+    log "Smoke test passed."
 
     # -------------------------------------------------------------------------
     # STAGE: SETUP (worktree creation)
@@ -1108,6 +1374,13 @@ Output the worktree path and branch name."
         set_stage_completed "setup"
         log "Setup complete. Worktree: $worktree, Branch: $branch"
 
+        # Self-assign the issue to prevent duplicate work from concurrent batches
+        if gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-assignee @me 2>/dev/null; then
+            log "Self-assigned issue #$ISSUE_NUMBER"
+        else
+            log "Warning: Could not self-assign issue #$ISSUE_NUMBER (non-blocking)"
+        fi
+
         # -------------------------------------------------------------------------
         # BUILD FRONTEND ASSETS (required for tests that render views)
         # -------------------------------------------------------------------------
@@ -1135,10 +1408,21 @@ Output the worktree path and branch name."
         local research_prompt="Research context for issue #$ISSUE_NUMBER in worktree $worktree.
 
 You must:
-1. Read the issue details from GitHub
-2. Explore related files and code structure
-3. Identify dependencies and related components
-4. Document relevant context for implementation
+1. Read the issue details AND all comments from GitHub:
+   gh issue view $ISSUE_NUMBER --repo $REPO --json title,body,comments
+2. Check for existing or closed PRs that reference this issue:
+   gh pr list --repo $REPO --state all --search \"$ISSUE_NUMBER\" --json number,title,state,body,reviews
+3. If prior work exists (comments with implementation details, closed/rejected PRs, review feedback):
+   a. Summarize what was previously attempted and the outcome
+   b. Extract specific review feedback or rejection reasons
+   c. Identify what should be preserved vs. changed in this attempt
+   d. Note any partial branches or commits that could be built upon
+4. Explore related files and code structure in the worktree
+5. Identify dependencies and related components
+6. Document all relevant context for implementation, clearly separating:
+   - Issue requirements (from issue body)
+   - Prior work context (from comments and closed PRs)
+   - Codebase context (from file exploration)
 
 Output the research findings."
 
@@ -1162,10 +1446,11 @@ Output the research findings."
         local evaluate_prompt="Evaluate the best implementation approach for issue #$ISSUE_NUMBER.
 
 Based on the research, determine:
-1. The recommended approach
+1. The recommended approach (if prior work exists, explain how this builds on or diverges from it)
 2. Rationale for this approach
 3. Potential risks or concerns
 4. Alternative approaches considered
+5. If prior attempts failed or were rejected, explain how this approach addresses the previous feedback
 
 Output your evaluation with a summary suitable for a GitHub comment."
 
@@ -1234,13 +1519,37 @@ $risks_text"
     else
         set_stage_started "plan"
 
+        # Build retrospective learnings block if memory file exists
+        local retro_learnings=""
+        if [[ -f "$RETRO_MEMORY_FILE" ]]; then
+            # Extract Active Learnings section (first 60 lines after the header)
+            retro_learnings=$(sed -n '/^## Active Learnings/,/^## Deprecated Learnings/p' "$RETRO_MEMORY_FILE" | head -60)
+            if [[ -n "$retro_learnings" ]]; then
+                retro_learnings="
+
+## Learnings from Previous Runs
+
+The following patterns were observed in prior orchestrator runs. Use these to inform agent selection and task decomposition:
+
+$retro_learnings"
+            fi
+        fi
+
         local plan_prompt="Create an implementation plan for issue #$ISSUE_NUMBER in worktree $worktree on branch $branch.
 
 Based on the evaluation, you must:
 1. Write a detailed implementation plan using writing-plans skill
 2. Break down into tasks with agent assignments
-3. Each task should specify: id, description, and agent (laravel-backend-developer or bulletproof-frontend-developer)
+3. Each task should specify: id, description, and the most appropriate agent
 
+Available agents for task assignment:
+- laravel-backend-developer: PHP/Laravel controllers, models, services, middleware, Eloquent, migrations, API endpoints, auth, PHPUnit tests
+- bulletproof-frontend-developer: CSS architecture, responsive design, Blade templates, frontend code -- defers PHP to laravel-backend-developer
+- bash-script-craftsman: Shell scripts, portability, BATS testing -- use for any .sh file changes
+- technical-doc-writer: Architecture docs, design docs, data flow docs, API contracts in docs/{domain}/ folders -- GitHub Markdown with Mermaid diagrams
+
+Choose the agent whose expertise best matches each task. Most tasks will use laravel-backend-developer or bulletproof-frontend-developer, but infrastructure and script tasks should use the appropriate specialist.
+$retro_learnings
 Output the plan path, task list, a summary of the plan, and a markdown-formatted task list for GitHub."
 
         local plan_result
@@ -1532,6 +1841,11 @@ Include 'Closes #$ISSUE_NUMBER' in the body."
         local spec_prompt="Verify PR #$pr_number achieves the goals of issue #$ISSUE_NUMBER.
 
 Check goal achievement, not code quality. Flag scope creep.
+
+IMPORTANT: Before flagging any acceptance criterion as missing, check the BASE BRANCH ($BASE_BRANCH) to see if the feature already exists there. If a criterion is already satisfied by pre-existing code on the base branch that the PR preserves, mark it as met (🔄 Met differently — pre-existing on base branch), NOT as missing. Only flag criteria as unmet if the feature is absent from BOTH the PR diff AND the base branch.
+
+Working directory: $worktree
+
 Output a summary suitable for a GitHub comment."
 
         local spec_result
@@ -1554,7 +1868,13 @@ $spec_summary" "spec-reviewer"
         local code_prompt="Review code quality of PR #$pr_number against base $BASE_BRANCH.
 
 Check patterns, standards, security. Approve or request changes.
-Output a summary suitable for a GitHub comment."
+Output a summary suitable for a GitHub comment.
+
+If changes are requested, set recommended_fix_agent to the most appropriate agent for the fixes:
+- laravel-backend-developer: PHP/Laravel code (controllers, models, services, middleware, migrations, tests)
+- bulletproof-frontend-developer: CSS, Blade templates, HTML, frontend code
+- bash-script-craftsman: Shell scripts, BATS tests
+- technical-doc-writer: Architecture docs, design docs, data flows in docs/{domain}/"
 
         local code_result
         code_result=$(run_stage "code-review-iter-$pr_iteration" "$code_prompt" "implement-issue-review.json" "code-reviewer")
@@ -1591,14 +1911,22 @@ $code_comments
 
 Fix the issues and commit. Output a summary of fixes applied."
 
+            # Use code-reviewer's recommended agent, fall back to laravel-backend-developer
+            local pr_fix_agent
+            pr_fix_agent=$(printf '%s' "$code_result" | jq -r '.recommended_fix_agent // empty')
+            if [[ -z "$pr_fix_agent" ]]; then
+                pr_fix_agent="laravel-backend-developer"
+            fi
+            log "PR review fix agent: $pr_fix_agent (recommended by code-reviewer)"
+
             local fix_result
-            fix_result=$(run_stage "fix-pr-review-iter-$pr_iteration" "$fix_prompt" "implement-issue-fix.json" "laravel-backend-developer")
+            fix_result=$(run_stage "fix-pr-review-iter-$pr_iteration" "$fix_prompt" "implement-issue-fix.json" "$pr_fix_agent")
 
             local fix_summary
             fix_summary=$(printf '%s' "$fix_result" | jq -r '.summary // "Fixes applied"')
 
             # Comment #13: PR Fix Result
-            comment_pr "$pr_number" "PR Review Fix (Iteration $pr_iteration)" "$fix_summary" "laravel-backend-developer"
+            comment_pr "$pr_number" "PR Review Fix (Iteration $pr_iteration)" "$fix_summary" "$pr_fix_agent"
 
             # Re-run quality loop after PR review fixes
             log "Re-running quality loop after PR review fixes..."
@@ -1606,11 +1934,84 @@ Fix the issues and commit. Output a summary of fixes applied."
 
             # Push updates
             log "Pushing updates to PR..."
-            git -C "$worktree" push origin "$branch" 2>/dev/null || log "Warning: Could not push to origin"
+            git_with_retry -C "$worktree" push origin "$branch" || log "Warning: Could not push to origin"
         fi
         done
 
         set_stage_completed "pr_review"
+    fi
+
+    # -------------------------------------------------------------------------
+    # STAGE: TECH DOCS (assess and write/update technical documentation)
+    # -------------------------------------------------------------------------
+    if [[ -n "$RESUME_MODE" ]] && is_stage_completed "tech_docs"; then
+        log "Skipping tech_docs stage (already completed)"
+    else
+        set_stage_started "tech_docs"
+
+        local tech_docs_prompt="Assess whether the changes in PR #$pr_number for issue #$ISSUE_NUMBER require new or updated technical documentation in docs/{domain}/ folders.
+
+Working in worktree $worktree on branch $branch.
+
+Step 1: Analyze the scope of changes:
+  git -C $worktree diff $BASE_BRANCH...HEAD --stat
+  git -C $worktree diff $BASE_BRANCH...HEAD --name-only
+
+Step 2: Review existing docs:
+  ls $worktree/docs/
+
+Step 3: Determine if documentation changes are needed. Docs ARE needed when:
+  - A new subsystem, service, or integration was added
+  - An existing architecture or data flow changed significantly
+  - New API endpoints were introduced
+  - A complex feature was added that needs design explanation
+  - Infrastructure or deployment configuration changed
+
+Docs are NOT needed when:
+  - Only minor bug fixes or small tweaks
+  - CSS/styling changes only
+  - Test-only changes
+  - Changes already covered by existing docs
+
+Step 4: If docs are needed:
+  - Create new docs in the appropriate docs/{domain}/ folder
+  - Or update existing docs to reflect the changes
+  - Use GitHub Markdown with Mermaid diagrams, alerts, tables, collapsible sections
+  - Ensure the domain README.md links to any new docs
+  - Commit with message: docs(issue-$ISSUE_NUMBER): add/update technical documentation
+  - Push to branch: git -C $worktree push origin $branch
+
+Step 5: If no docs are needed, set status to 'skipped' and explain why.
+
+Output the assessment result, any docs created/updated, and a summary."
+
+        local tech_docs_result
+        tech_docs_result=$(run_stage "tech-docs" "$tech_docs_prompt" "implement-issue-tech-docs.json" "technical-doc-writer")
+
+        local tech_docs_status tech_docs_summary docs_needed
+        tech_docs_status=$(printf '%s' "$tech_docs_result" | jq -r '.status')
+        tech_docs_summary=$(printf '%s' "$tech_docs_result" | jq -r '.summary // "Documentation assessment completed"')
+        docs_needed=$(printf '%s' "$tech_docs_result" | jq -r '.docs_needed')
+
+        if [[ "$docs_needed" == "true" ]]; then
+            # Build actions list for comment
+            local actions_md
+            actions_md=$(printf '%s' "$tech_docs_result" | jq -r '.actions // [] | map("- **\(.action):** `\(.file)` — \(.description)") | join("\n")')
+
+            comment_pr "$pr_number" "Technical Documentation" "**Documentation updated for this PR.**
+
+$actions_md
+
+$tech_docs_summary" "technical-doc-writer"
+        else
+            comment_pr "$pr_number" "Technical Documentation" "No documentation changes needed.
+
+$tech_docs_summary" "technical-doc-writer"
+        fi
+
+        printf '%s\n' "$tech_docs_result" > "$LOG_BASE/context/tech-docs-output.json"
+        set_stage_completed "tech_docs"
+        log "Tech docs stage complete. Docs needed: $docs_needed"
     fi
 
     # -------------------------------------------------------------------------
@@ -1652,8 +2053,11 @@ $complete_summary
         set_final_state "completed"
     fi
 
-    # Copy final status to log dir
-    cp "$STATUS_FILE" "$LOG_BASE/status.json"
+    # Ensure final status is in log dir (no-op if STATUS_FILE is already there)
+    sync_status_to_log
+
+    # Run retrospective before final exit (explicit call for successful runs)
+    run_retrospective 0
 
     log "=========================================="
     log "Implement Issue Complete"

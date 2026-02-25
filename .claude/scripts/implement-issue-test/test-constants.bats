@@ -79,12 +79,12 @@ teardown() {
 # DEFAULT VALUES
 # =============================================================================
 
-@test "default STATUS_FILE is status.json" {
-    # Re-source with fresh defaults
+@test "default STATUS_FILE is empty (set to LOG_BASE/status.json at runtime)" {
+    # STATUS_FILE defaults to empty string, gets set to LOG_BASE/status.json during init
     local script_content
     script_content=$(cat "$ORCHESTRATOR_SCRIPT")
 
-    [[ "$script_content" == *'STATUS_FILE="status.json"'* ]]
+    [[ "$script_content" == *'STATUS_FILE=""'* ]]
 }
 
 @test "AGENT defaults to empty string" {

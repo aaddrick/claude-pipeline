@@ -51,7 +51,7 @@ You will analyze recently modified code and apply refinements that:
    - Make the code harder to debug or extend
    - Break existing Eloquent relationships or event dispatching
 
-5. **Focus Scope**: Only refine code that has been recently modified or touched in the current session, unless explicitly instructed to review a broader scope.
+5. **Focus Scope**: Only refine code that is directly related to the current task's deliverables. NEVER modify files that were not part of the task's requirements, even if you notice improvements in adjacent code. If a file was only incidentally touched (e.g., an import changed by another agent), do not simplify it. When in doubt, confirm the file is in scope.
 
 Your refinement process:
 

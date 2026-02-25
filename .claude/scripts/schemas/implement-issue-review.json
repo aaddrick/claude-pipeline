@@ -15,6 +15,10 @@
         }
       }
     },
+    "recommended_fix_agent": {
+      "type": "string",
+      "description": "The most appropriate agent to fix the issues found (e.g., laravel-backend-developer, bulletproof-frontend-developer, bash-script-craftsman)"
+    },
     "summary": {"type": "string"}
   },
   "required": ["result", "summary"]

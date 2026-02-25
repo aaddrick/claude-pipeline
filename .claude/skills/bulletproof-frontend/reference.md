@@ -703,6 +703,31 @@ div#header ul.nav li.active a.link { ... }
 .element { margin-top: var(--spacing-lg); }
 ```
 
+### 6. Adding Classes to `<a>` Tags Without `:visited` Rules
+When you add a class to an anchor, catch-all selectors like `.dark a:visited:not([class])` stop matching. Always add explicit `:visited` rules alongside `:link`/`:hover` for any classed link.
+```css
+/* BAD: Relies on catch-all — breaks when class is added */
+.dark a:visited:not([class]) { color: var(--color-primary-300); }
+
+/* GOOD: Explicit :visited on the classed link */
+.link--custom { color: var(--color-primary); }
+.link--custom:visited { color: var(--color-primary); }
+.dark .link--custom:visited { color: var(--color-primary-400); }
+```
+
+### 7. Measuring DOM Elements Immediately After Showing Them
+After removing `hidden` or changing `display`, the browser hasn't laid out the element yet. `getBoundingClientRect()` returns stale (often zero) dimensions. Force a reflow first.
+```javascript
+/* BAD: Dimensions are 0 */
+element.classList.remove('hidden');
+const rect = element.getBoundingClientRect(); // width=0, height=0
+
+/* GOOD: Force reflow before measuring */
+element.classList.remove('hidden');
+element.offsetHeight; // triggers synchronous layout
+const rect = element.getBoundingClientRect(); // accurate
+```
+
 ---
 
 ## Testing Checklist

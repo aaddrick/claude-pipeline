@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "status": {"enum": ["success", "skipped", "error"]},
+    "docs_needed": {"type": "boolean"},
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "action": {"enum": ["created", "updated"]},
+          "file": {"type": "string"},
+          "description": {"type": "string"}
+        },
+        "required": ["action", "file", "description"]
+      }
+    },
+    "commit": {"type": "string"},
+    "summary": {"type": "string"},
+    "error": {"type": ["string", "null"]}
+  },
+  "required": ["status", "docs_needed", "summary"]
+}

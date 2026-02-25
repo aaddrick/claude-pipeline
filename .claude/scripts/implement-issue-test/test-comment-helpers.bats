@@ -44,12 +44,17 @@ teardown() {
 # REPO CONSTANT
 # =============================================================================
 
-@test "REPO constant is defined" {
-    [ -n "$REPO" ]
+@test "REPO is auto-detected from git remote" {
+    local func_content
+    func_content=$(cat "$ORCHESTRATOR_SCRIPT")
+    [[ "$func_content" == *"git remote get-url origin"* ]]
 }
 
-@test "REPO points to correct repository" {
-    [ -n "$REPO" ]
+@test "REPO detection extracts owner/repo from GitHub URL" {
+    local func_content
+    func_content=$(cat "$ORCHESTRATOR_SCRIPT")
+    [[ "$func_content" == *'sed -E'* ]]
+    [[ "$func_content" == *'github'* ]]
 }
 
 # =============================================================================
@@ -290,9 +295,10 @@ EOF
     [[ "$main_def" == *'comment_pr "$pr_number" "Implementation Complete"'* ]]
 }
 
-@test "quality loop calls comment_issue" {
+@test "quality loop uses log instead of comment_issue for internal stages" {
     local func_def
     func_def=$(declare -f run_quality_loop)
 
-    [[ "$func_def" == *"comment_issue"* ]]
+    # Quality loop now logs internally instead of posting comments
+    [[ "$func_def" == *"log "* ]]
 }

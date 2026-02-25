@@ -39,7 +39,8 @@ timeout "$STAGE_TIMEOUT" claude -p "prompt" ...
 | `--json-schema <schema>` | Enforce structured output matching JSON Schema |
 | `--output-format json` | Return JSON with `structured_output` field |
 | `--dangerously-skip-permissions` | Skip permission prompts (sandbox only) |
-| `--resume <session-id>` | Resume a previous session |
+| `--no-session-persistence` | **Required for orchestration** - start fresh session, prevent cached session contamination |
+| `--resume <session-id>` | Resume a previous session (only for explicit rate-limit recovery) |
 | `--model <model>` | Override model (sonnet, opus, haiku) |
 | `--system-prompt <prompt>` | Custom system prompt |
 | `--max-budget-usd <amount>` | Limit API spend per invocation |
@@ -362,6 +363,7 @@ run_stage() {
 
     output=$(timeout "$STAGE_TIMEOUT" claude -p "$prompt" \
         "${agent_args[@]}" \
+        --no-session-persistence \
         --dangerously-skip-permissions \
         --output-format json \
         --json-schema "$schema" \
@@ -1042,6 +1044,10 @@ Before delivering, verify:
 - [ ] Lock file prevents concurrent runs
 - [ ] Schemas validate with jq
 
+### Session Isolation
+- [ ] All `claude -p` calls include `--no-session-persistence` (prevents cached session contamination)
+- [ ] Only explicit `--resume $SESSION_ID` for rate-limit recovery
+
 ### Error Handling
 - [ ] Rate limit detection and handling
 - [ ] Timeout handling (exit code 124)
@@ -1055,6 +1061,27 @@ Before delivering, verify:
 - [ ] Edge case tests for JSON with hyphens, backslashes
 - [ ] Fixture tests with realistic Claude CLI output
 
+### 6. Session Contamination Without `--no-session-persistence`
+
+**Problem:** Without `--no-session-persistence`, `claude -p` may resume a cached session from a previous invocation. The model sees old context, thinks the work is "already done", and returns a generic message instead of following the schema prompt. This causes "No structured output" failures.
+
+```bash
+# WRONG: May resume a stale session
+output=$(claude -p "Setup worktree for issue #51" \
+    --output-format json --json-schema "$schema" 2>&1)
+# Result: {"result":"Already processed — all background tasks have been handled."}
+# structured_output is missing!
+
+# CORRECT: Always start fresh for orchestration stages
+output=$(claude -p "Setup worktree for issue #51" \
+    --no-session-persistence \
+    --output-format json --json-schema "$schema" 2>&1)
+```
+
+**Exception:** Explicit `--resume $SESSION_ID` after rate-limit recovery is intentional and correct — you want to continue the same session there.
+
+**Real failure:** An orchestrator's setup stage read 771K cached tokens, returned "Already processed" in 24 tokens, and the script aborted with "No structured output from setup".
+
 ---
 
 ## Anti-Pattern Quick Reference
@@ -1067,6 +1094,7 @@ Before delivering, verify:
 | `run` without `$status` | BATS test always passes | Always check `[ "$status" -eq X ]` |
 | Variables in `run` | Lost in subshell | Call function directly |
 | `set -e` | Unpredictable failures | Handle errors explicitly |
+| `claude -p` without `--no-session-persistence` | Resumes stale session, skips schema | Always add `--no-session-persistence` |
 | `[ ]` in bash | Word-splitting issues | Use `[[ ]]` |
 
 ---

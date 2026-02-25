@@ -7,6 +7,20 @@
 #   ./batch-orchestrator.sh --manifest <path>
 #   ./batch-orchestrator.sh --issues "123,124,125" --branch "test"
 #   ./batch-orchestrator.sh --manifest <path> --agent bulletproof-frontend-developer
+#   ./batch-orchestrator.sh --label "frontend" --no-assignee --branch "test"
+#   ./batch-orchestrator.sh --label "bug" --label "priority:high" --branch "test" --limit 5
+#   ./batch-orchestrator.sh --issues "123,124,125" --branch "test" --concurrency 3
+#
+# Issue Selection:
+#   --issues <list>     Comma-separated list of issue numbers
+#   --label <name>      Filter by label (repeatable, AND logic)
+#   --no-assignee       Only issues with no assignee
+#   --state <state>     Issue state filter: open (default), closed, all
+#   --limit <n>         Max issues to fetch (default: 50)
+#   --repo <owner/repo> GitHub repo (auto-detected from git remote if omitted)
+#
+# Concurrency:
+#   --concurrency N  Run up to N issues in parallel (default: 1, max: 5)
 #
 # Agent Selection:
 #   --agent <name>  Specify agent for implement-issue (e.g., bulletproof-frontend-developer,
@@ -15,6 +29,7 @@
 # Outputs:
 #   - status.json: Real-time progress (read by handle-issues skill)
 #   - logs/batch-<timestamp>/: Per-issue logs and final summary
+#   - logs/batch-<timestamp>/issue-<N>.log: Per-issue log (tail -f friendly)
 #
 # Exit codes:
 #   0  - All issues processed successfully
@@ -33,6 +48,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCHEMA_DIR="$SCRIPT_DIR/schemas"
 LOG_BASE="logs/batch-$(date +%Y%m%d-%H%M%S)"
 STATUS_FILE="status.json"
+STATUS_LOCK="${STATUS_FILE}.lock"
 LOCK_FILE="logs/.batch-orchestrator.lock"
 
 # Timeouts and limits
@@ -49,17 +65,32 @@ MANIFEST=""
 ISSUES=""
 BRANCH=""
 AGENT=""
+LABELS=()
+NO_ASSIGNEE=false
+ISSUE_STATE="open"
+QUERY_LIMIT=50
+REPO=""
+CONCURRENCY=1
 
 usage() {
     echo "Usage: $0 --manifest <path>"
     echo "       $0 --issues \"123,124,125\" --branch \"test\""
+    echo "       $0 --label \"frontend\" --no-assignee --branch \"test\""
     echo "       $0 --manifest <path> --agent bulletproof-frontend-developer"
     echo ""
-    echo "Options:"
+    echo "Issue Selection (choose one):"
     echo "  --manifest <path>   Path to manifest.json with issues and branch"
     echo "  --issues <list>     Comma-separated list of issue numbers"
-    echo "  --branch <name>     Base branch for PRs"
+    echo "  --label <name>      Filter by label (repeatable, AND logic)"
+    echo "  --no-assignee       Only issues with no assignee"
+    echo "  --state <state>     Issue state: open (default), closed, all"
+    echo "  --limit <n>         Max issues to fetch when querying (default: 50)"
+    echo "  --repo <owner/repo> GitHub repo (auto-detected from git remote if omitted)"
+    echo ""
+    echo "Common Options:"
+    echo "  --branch <name>     Base branch for PRs (required)"
     echo "  --agent <name>      Agent for implement-issue stage (optional)"
+    echo "  --concurrency <n>   Run up to N issues in parallel (default: 1, max: 5)"
     echo ""
     echo "Available agents:"
     echo "  bulletproof-frontend-developer  CSS, HTML, Blade templates, frontend"
@@ -92,6 +123,35 @@ while [[ $# -gt 0 ]]; do
             AGENT="$2"
             shift 2
             ;;
+        --label)
+            [[ -n "${2:-}" ]] || { echo "ERROR: --label requires a value" >&2; exit 3; }
+            LABELS+=("$2")
+            shift 2
+            ;;
+        --no-assignee)
+            NO_ASSIGNEE=true
+            shift
+            ;;
+        --state)
+            [[ -n "${2:-}" ]] || { echo "ERROR: --state requires a value" >&2; exit 3; }
+            ISSUE_STATE="$2"
+            shift 2
+            ;;
+        --limit)
+            [[ -n "${2:-}" ]] || { echo "ERROR: --limit requires a value" >&2; exit 3; }
+            QUERY_LIMIT="$2"
+            shift 2
+            ;;
+        --repo)
+            [[ -n "${2:-}" ]] || { echo "ERROR: --repo requires a value" >&2; exit 3; }
+            REPO="$2"
+            shift 2
+            ;;
+        --concurrency)
+            [[ -n "${2:-}" ]] || { echo "ERROR: --concurrency requires a value" >&2; exit 3; }
+            CONCURRENCY="$2"
+            shift 2
+            ;;
         --help|-h)
             usage
             ;;
@@ -116,9 +176,58 @@ if [[ -n "$MANIFEST" ]]; then
     fi
 fi
 
+# =============================================================================
+# GITHUB ISSUE QUERY (when using --label / --no-assignee filters)
+# =============================================================================
+
+if [[ -z "$ISSUES" && ${#LABELS[@]} -gt 0 ]]; then
+    # Detect repo from git remote if not specified
+    if [[ -z "$REPO" ]]; then
+        REPO=$(git remote get-url origin 2>/dev/null | sed -E 's#.*github\.com[:/](.+/[^.]+)(\.git)?$#\1#')
+        if [[ -z "$REPO" ]]; then
+            echo "ERROR: Could not detect repo from git remote. Use --repo owner/repo" >&2
+            exit 3
+        fi
+        echo "Auto-detected repo: $REPO"
+    fi
+
+    # Build gh issue list command
+    GH_ARGS=(gh issue list --repo "$REPO" --state "$ISSUE_STATE" --limit "$QUERY_LIMIT" --json "number,assignees")
+    for label in "${LABELS[@]}"; do
+        GH_ARGS+=(--label "$label")
+    done
+
+    echo "Querying GitHub: ${GH_ARGS[*]}"
+
+    GH_OUTPUT=$("${GH_ARGS[@]}" 2>&1) || {
+        echo "ERROR: GitHub query failed: $GH_OUTPUT" >&2
+        exit 3
+    }
+
+    # Apply --no-assignee filter, sort by issue number ascending (oldest first)
+    if [[ "$NO_ASSIGNEE" == "true" ]]; then
+        ISSUES=$(echo "$GH_OUTPUT" | jq -r '[.[] | select(.assignees | length == 0) | .number] | sort | map(tostring) | join(",")')
+    else
+        ISSUES=$(echo "$GH_OUTPUT" | jq -r '[.[] | .number] | sort | map(tostring) | join(",")')
+    fi
+
+    if [[ -z "$ISSUES" ]]; then
+        echo "No issues found matching the query criteria."
+        exit 0
+    fi
+
+    echo "Found issues: $ISSUES"
+fi
+
 if [[ -z "$ISSUES" || -z "$BRANCH" ]]; then
-    echo "ERROR: Must provide --manifest or both --issues and --branch"
+    echo "ERROR: Must provide --manifest, --issues, or --label filters; --branch is always required"
     usage
+fi
+
+# Validate concurrency
+if ! [[ "$CONCURRENCY" =~ ^[0-9]+$ ]] || (( CONCURRENCY < 1 || CONCURRENCY > 5 )); then
+    echo "ERROR: --concurrency must be a number between 1 and 5 (got: $CONCURRENCY)" >&2
+    exit 3
 fi
 
 # Convert comma-separated to array
@@ -162,7 +271,30 @@ release_lock() {
     fi
 }
 
-trap release_lock EXIT
+declare -A running_jobs=()    # pid -> issue_number
+
+# Helpers for safe associative array access under set -u
+# (bash set -u treats empty assoc arrays as unbound)
+running_job_count() {
+    set +u; local c=${#running_jobs[@]}; set -u; echo "$c"
+}
+running_job_pids() {
+    set +u; echo "${!running_jobs[@]}"; set -u
+}
+
+cleanup() {
+    # Kill any remaining background jobs
+    local pids
+    pids=$(running_job_pids)
+    for pid in $pids; do
+        kill "$pid" 2>/dev/null
+    done
+    wait 2>/dev/null
+    release_lock
+    rm -f "$STATUS_LOCK"
+}
+
+trap cleanup EXIT
 acquire_lock
 
 # =============================================================================
@@ -171,13 +303,18 @@ acquire_lock
 
 mkdir -p "$LOG_BASE"
 LOG_FILE="$LOG_BASE/orchestrator.log"
+CURRENT_ISSUE_LOG=""  # Set per-issue; log() writes here too when non-empty
 
 log() {
-    echo "[$(date -Iseconds)] $*" | tee -a "$LOG_FILE"
+    local line="[$(date -Iseconds)] $*"
+    echo "$line" | tee -a "$LOG_FILE"
+    [[ -n "$CURRENT_ISSUE_LOG" ]] && echo "$line" >> "$CURRENT_ISSUE_LOG"
 }
 
 log_error() {
-    echo "[$(date -Iseconds)] ERROR: $*" | tee -a "$LOG_FILE" >&2
+    local line="[$(date -Iseconds)] ERROR: $*"
+    echo "$line" | tee -a "$LOG_FILE" >&2
+    [[ -n "$CURRENT_ISSUE_LOG" ]] && echo "$line" >> "$CURRENT_ISSUE_LOG"
 }
 
 # =============================================================================
@@ -187,7 +324,7 @@ log_error() {
 init_status() {
     local issues_json="[]"
     for issue in "${ISSUE_ARRAY[@]}"; do
-        issues_json=$(echo "$issues_json" | jq --argjson num "$issue" '. + [{
+        issues_json=$(echo "$issues_json" | jq --argjson num "$issue" --arg log "$LOG_BASE/issue-$issue.log" '. + [{
             "number": $num,
             "status": "pending",
             "stage": null,
@@ -196,7 +333,8 @@ init_status() {
             "error": null,
             "follow_ups": [],
             "started_at": null,
-            "completed_at": null
+            "completed_at": null,
+            "log_file": $log
         }]')
     done
 
@@ -209,7 +347,7 @@ init_status() {
         '{
             state: $state,
             base_branch: $branch,
-            current_issue: null,
+            current_issues: [],
             progress: {
                 total: $total,
                 completed: 0,
@@ -236,36 +374,58 @@ update_issue_field() {
     local value="$3"
     local is_json="${4:-false}"
 
-    if [[ "$is_json" == "true" ]]; then
-        jq --argjson num "$issue_num" \
-           --arg field "$field" \
-           --argjson val "$value" \
-           '(.issues[] | select(.number == $num))[$field] = $val |
-            .last_update = (now | todate)' \
-           "$STATUS_FILE" > "${STATUS_FILE}.tmp" && mv "${STATUS_FILE}.tmp" "$STATUS_FILE"
-    else
-        jq --argjson num "$issue_num" \
-           --arg field "$field" \
-           --arg val "$value" \
-           '(.issues[] | select(.number == $num))[$field] = $val |
-            .last_update = (now | todate)' \
-           "$STATUS_FILE" > "${STATUS_FILE}.tmp" && mv "${STATUS_FILE}.tmp" "$STATUS_FILE"
-    fi
+    (
+        flock 9
+        if [[ "$is_json" == "true" ]]; then
+            jq --argjson num "$issue_num" \
+               --arg field "$field" \
+               --argjson val "$value" \
+               '(.issues[] | select(.number == $num))[$field] = $val |
+                .last_update = (now | todate)' \
+               "$STATUS_FILE" > "${STATUS_FILE}.tmp.$$" && mv "${STATUS_FILE}.tmp.$$" "$STATUS_FILE"
+        else
+            jq --argjson num "$issue_num" \
+               --arg field "$field" \
+               --arg val "$value" \
+               '(.issues[] | select(.number == $num))[$field] = $val |
+                .last_update = (now | todate)' \
+               "$STATUS_FILE" > "${STATUS_FILE}.tmp.$$" && mv "${STATUS_FILE}.tmp.$$" "$STATUS_FILE"
+        fi
+    ) 9>"$STATUS_LOCK"
 }
 
 update_progress() {
-    jq '.progress.completed = ([.issues[] | select(.status == "completed")] | length) |
-        .progress.failed = ([.issues[] | select(.status == "failed" or .status == "skipped")] | length) |
-        .progress.in_progress = ([.issues[] | select(.status == "in_progress")] | length) |
-        .progress.pending = ([.issues[] | select(.status == "pending")] | length) |
-        .last_update = (now | todate)' \
-        "$STATUS_FILE" > "${STATUS_FILE}.tmp" && mv "${STATUS_FILE}.tmp" "$STATUS_FILE"
+    (
+        flock 9
+        jq '.progress.completed = ([.issues[] | select(.status == "completed")] | length) |
+            .progress.failed = ([.issues[] | select(.status == "failed" or .status == "skipped")] | length) |
+            .progress.in_progress = ([.issues[] | select(.status == "in_progress")] | length) |
+            .progress.pending = ([.issues[] | select(.status == "pending")] | length) |
+            .last_update = (now | todate)' \
+            "$STATUS_FILE" > "${STATUS_FILE}.tmp.$$" && mv "${STATUS_FILE}.tmp.$$" "$STATUS_FILE"
+    ) 9>"$STATUS_LOCK"
 }
 
-set_current_issue() {
+add_current_issue() {
     local issue_num="$1"
-    jq --argjson num "$issue_num" '.current_issue = $num | .last_update = (now | todate)' \
-        "$STATUS_FILE" > "${STATUS_FILE}.tmp" && mv "${STATUS_FILE}.tmp" "$STATUS_FILE"
+    (
+        flock 9
+        jq --argjson num "$issue_num" \
+            '.current_issues = ((.current_issues // []) + [$num] | unique) |
+             .last_update = (now | todate)' \
+            "$STATUS_FILE" > "${STATUS_FILE}.tmp.$$" && mv "${STATUS_FILE}.tmp.$$" "$STATUS_FILE"
+    ) 9>"$STATUS_LOCK"
+}
+
+remove_current_issue() {
+    local issue_num="$1"
+    (
+        flock 9
+        jq --argjson num "$issue_num" \
+            '.current_issues = [(.current_issues // [])[] | select(. != $num)] |
+             .last_update = (now | todate)' \
+            "$STATUS_FILE" > "${STATUS_FILE}.tmp.$$" && mv "${STATUS_FILE}.tmp.$$" "$STATUS_FILE"
+    ) 9>"$STATUS_LOCK"
 }
 
 set_rate_limit() {
@@ -285,18 +445,24 @@ set_rate_limit() {
         session_id="\"$session_id\""
     fi
 
-    jq --argjson waiting "$waiting" \
-       --argjson resume "$resume_at" \
-       --argjson session "$session_id" \
-       '.rate_limit = {waiting: $waiting, resume_at: $resume, session_id: $session} |
-        .last_update = (now | todate)' \
-       "$STATUS_FILE" > "${STATUS_FILE}.tmp" && mv "${STATUS_FILE}.tmp" "$STATUS_FILE"
+    (
+        flock 9
+        jq --argjson waiting "$waiting" \
+           --argjson resume "$resume_at" \
+           --argjson session "$session_id" \
+           '.rate_limit = {waiting: $waiting, resume_at: $resume, session_id: $session} |
+            .last_update = (now | todate)' \
+           "$STATUS_FILE" > "${STATUS_FILE}.tmp.$$" && mv "${STATUS_FILE}.tmp.$$" "$STATUS_FILE"
+    ) 9>"$STATUS_LOCK"
 }
 
 set_state() {
     local state="$1"
-    jq --arg state "$state" '.state = $state | .last_update = (now | todate)' \
-        "$STATUS_FILE" > "${STATUS_FILE}.tmp" && mv "${STATUS_FILE}.tmp" "$STATUS_FILE"
+    (
+        flock 9
+        jq --arg state "$state" '.state = $state | .last_update = (now | todate)' \
+            "$STATUS_FILE" > "${STATUS_FILE}.tmp.$$" && mv "${STATUS_FILE}.tmp.$$" "$STATUS_FILE"
+    ) 9>"$STATUS_LOCK"
 }
 
 # =============================================================================
@@ -418,12 +584,13 @@ cleanup_worktree() {
 process_issue() {
     local issue_num="$1"
     local issue_log="$LOG_BASE/issue-$issue_num.log"
+    CURRENT_ISSUE_LOG="$issue_log"
 
     log "=========================================="
     log "Starting issue #$issue_num"
     log "=========================================="
 
-    set_current_issue "$issue_num"
+    add_current_issue "$issue_num"
     update_issue_field "$issue_num" "status" "in_progress"
     update_issue_field "$issue_num" "started_at" "$(date -Iseconds)"
     update_issue_field "$issue_num" "stage" "implement-issue"
@@ -495,6 +662,7 @@ process_issue() {
         update_issue_field "$issue_num" "status" "failed"
         update_issue_field "$issue_num" "error" "${impl_error:-implement-issue failed with status: $impl_status}"
         update_progress
+        remove_current_issue "$issue_num"
         return 1
     fi
 
@@ -503,6 +671,7 @@ process_issue() {
         update_issue_field "$issue_num" "status" "failed"
         update_issue_field "$issue_num" "error" "No PR number in status file or output"
         update_progress
+        remove_current_issue "$issue_num"
         return 1
     fi
     log "implement-issue complete. PR #$pr_number created"
@@ -519,6 +688,7 @@ process_issue() {
 
     proc_output=$(timeout "$ISSUE_TIMEOUT" claude -p "/process-pr $pr_number $issue_num $BRANCH" \
         --agent code-reviewer \
+        --no-session-persistence \
         --dangerously-skip-permissions \
         --output-format json \
         --json-schema "$PROCESS_SCHEMA" \
@@ -577,6 +747,7 @@ process_issue() {
         update_issue_field "$issue_num" "status" "failed"
         update_issue_field "$issue_num" "error" "Timeout after ${ISSUE_TIMEOUT}s during process-pr"
         update_progress
+        remove_current_issue "$issue_num"
         return 1
     fi
 
@@ -612,11 +783,13 @@ process_issue() {
             update_issue_field "$issue_num" "status" "failed"
             update_issue_field "$issue_num" "error" "${proc_error:-process-pr failed with status: $proc_status}"
             update_progress
+            remove_current_issue "$issue_num"
             return 1
             ;;
     esac
 
     update_progress
+    remove_current_issue "$issue_num"
     return 0
 }
 
@@ -629,16 +802,42 @@ log "Batch Orchestrator Starting"
 log "=========================================="
 log "Issues: ${ISSUE_ARRAY[*]}"
 log "Branch: $BRANCH"
+log "Concurrency: $CONCURRENCY"
 log "Implement agent: ${AGENT:-default}"
 log "Process-PR agent: code-reviewer"
 log "Log dir: $LOG_BASE"
 log "Timeout per issue: ${ISSUE_TIMEOUT}s"
-log "Max consecutive failures: $MAX_CONSECUTIVE_FAILURES"
+log "Max failures before circuit breaker: $MAX_CONSECUTIVE_FAILURES"
 
 init_status
 
-consecutive_failures=0
+# Job tracking
+declare -A job_results     # issue_number -> exit_code
+total_failures=0
 exit_code=0
+
+reap_finished_jobs() {
+    local finished_pid
+    local pids
+    pids=$(running_job_pids)
+    [[ -z "$pids" ]] && return
+    # shellcheck disable=SC2086
+    wait -n -p finished_pid $pids 2>/dev/null
+    local job_exit=$?
+    if [[ -z "${finished_pid:-}" ]]; then
+        return
+    fi
+    local issue_num="${running_jobs[$finished_pid]}"
+    unset 'running_jobs[$finished_pid]'
+    job_results[$issue_num]=$job_exit
+
+    if (( job_exit != 0 )); then
+        ((total_failures++))
+        exit_code=1
+    fi
+
+    log "Job for issue #$issue_num finished (exit=$job_exit). Running: $(running_job_count), Failed: $total_failures"
+}
 
 for issue in "${ISSUE_ARRAY[@]}"; do
     # Check idempotency - skip if already completed in a previous run
@@ -649,32 +848,50 @@ for issue in "${ISSUE_ARRAY[@]}"; do
         continue
     fi
 
-    if process_issue "$issue"; then
-        consecutive_failures=0
-        log "Issue #$issue processed successfully"
-    else
-        consecutive_failures=$((consecutive_failures + 1))
-        exit_code=1
-        log "Issue #$issue failed. Consecutive failures: $consecutive_failures / $MAX_CONSECUTIVE_FAILURES"
+    # Wait if all slots are full
+    while (( $(running_job_count) >= CONCURRENCY )); do
+        reap_finished_jobs
+    done
 
-        if (( consecutive_failures >= MAX_CONSECUTIVE_FAILURES )); then
-            log_error "CIRCUIT BREAKER: $MAX_CONSECUTIVE_FAILURES consecutive failures. Stopping batch."
-            set_state "circuit_breaker"
-            exit_code=2
-            break
-        fi
+    # Check circuit breaker before launching
+    if (( total_failures >= MAX_CONSECUTIVE_FAILURES )); then
+        log_error "CIRCUIT BREAKER: $total_failures failures reached. Stopping new launches."
+        break
     fi
+
+    # Launch issue processing
+    process_issue "$issue" &
+    running_jobs[$!]=$issue
+    log "Launched issue #$issue (PID $!, slots: $(running_job_count)/$CONCURRENCY)"
 done
 
+# Drain remaining jobs
+while (( $(running_job_count) > 0 )); do
+    reap_finished_jobs
+done
+
+# Circuit breaker: kill remaining if triggered mid-drain
+if (( total_failures >= MAX_CONSECUTIVE_FAILURES )); then
+    if (( $(running_job_count) > 0 )); then
+        log_error "CIRCUIT BREAKER: Killing $(running_job_count) remaining jobs"
+        for pid in $(running_job_pids); do
+            kill "$pid" 2>/dev/null
+        done
+        wait 2>/dev/null
+        running_jobs=()
+    fi
+    set_state "circuit_breaker"
+    exit_code=2
+fi
+
 # Final state
-final_failed=$(jq '.progress.failed' "$STATUS_FILE")
-if (( exit_code == 2 )); then
-    # Circuit breaker already set state
-    :
-elif (( final_failed > 0 )); then
-    set_state "completed_with_errors"
-else
-    set_state "completed"
+if (( exit_code != 2 )); then
+    final_failed=$(jq '.progress.failed' "$STATUS_FILE")
+    if (( final_failed > 0 )); then
+        set_state "completed_with_errors"
+    else
+        set_state "completed"
+    fi
 fi
 
 log "=========================================="
